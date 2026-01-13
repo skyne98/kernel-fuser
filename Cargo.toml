@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/fuse",
+]
+resolver = "3"
+
+[workspace.dependencies]
+anyhow = "1.0"
+cubecl = { version = "0.9.0-pre.6", features = ["cpu", "wgpu"] }
