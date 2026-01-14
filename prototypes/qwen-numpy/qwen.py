@@ -1,3 +1,18 @@
+"""
+Qwen 2.5/3 Numpy Prototype (Reference Implementation)
+
+This script provides a pure Python/Numpy implementation of the Qwen 3 architecture.
+It includes a native GGUF v3 reader and supports 'fused' quantized inference,
+meaning it operates directly on quantized weights (Q8_0, Q8_K) without fully
+dequantizing them to Float32 memory, mimicking how a high-performance GPU kernel works.
+
+Key Features:
+- Native GGUF Reader (no external C dependencies for loading).
+- Fused Block-Quantized Matrix Multiplication.
+- Qwen 3 specific architecture (Q-Norm, K-Norm, NEOX-style RoPE).
+- KV Cache with pre-allocation.
+"""
+
 import argparse
 import mmap
 import os
@@ -52,9 +67,23 @@ GGML_TYPE_I32 = 18
 # -----------------------------------------------------------------------------
 # Mini GGUF Reader
 # -----------------------------------------------------------------------------
+# Implements a parser for the GGUF v3 binary format.
+# Spec: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
+#
+# The file layout is:
+# 1. Header (Magic, Version, Counts)
+# 2. Key-Value Pairs (Metadata like dimensions, vocab, RoPE freq)
+# 3. Tensor Info Table (Name, Dims, Type, Offset)
+# 4. Padding (Alignment)
+# 5. Tensor Data (Binary blobs)
 
 
 class GGUFReader:
+    """
+    Reads GGUF files using memory mapping for efficiency.
+    Does not load tensor data into memory until get_tensor() is called.
+    """
+
     def __init__(self, path: str):
         self.path = path
         self.f = open(path, "rb")
@@ -113,7 +142,8 @@ class GGUFReader:
             raise ValueError(f"Unknown value type: {vtype}")
 
     def _load(self):
-        # Header
+        # 1. Header
+        # Magic "GGUF" (4 bytes)
         magic = self._read(4)
         if magic != GGUF_MAGIC:
             raise ValueError(f"Invalid GGUF magic: {magic}")
@@ -183,23 +213,31 @@ class GGUFReader:
             return arr.astype(np.float32).reshape(shape).copy()
 
         elif dtype_id == GGML_TYPE_Q8_0:
-            # Load raw quantized data into QuantizedTensor
+            # Q8_0 Layout:
+            # Block Size: 32 elements.
+            # Block Bytes: 34 bytes.
+            # Structure: [Delta (float16, 2 bytes)] + [Quants (int8, 32 bytes)]
+            #
+            # We parse this into two separate arrays:
+            # - scales: [n_blocks] (float32)
+            # - quants: [n_blocks, 32] (int8)
+
             block_size = 32
             block_stride = 34
             num_blocks = num_elem // block_size
             raw_bytes = raw_ptr[offset : offset + num_blocks * block_stride]
 
-            # Parse struct-of-arrays style
+            # View as [Blocks, Stride] bytes to slice columns
             data_view = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
                 num_blocks, block_stride
             )
-            # Scales (f16)
+            # Scales: Bytes 0-1 are f16
             scales = (
                 np.frombuffer(data_view[:, 0:2].flatten(), dtype=np.float16)
                 .astype(np.float32)
                 .copy()
             )
-            # Quants (int8)
+            # Quants: Bytes 2-34 are int8
             quants = (
                 np.frombuffer(data_view[:, 2:].flatten(), dtype=np.int8)
                 .reshape(num_blocks, block_size)
@@ -217,6 +255,14 @@ class GGUFReader:
             return QuantizedTensor(quants, scales, block_size)
 
         elif dtype_id == GGML_TYPE_Q8_K:
+            # Q8_K Layout:
+            # Block Size: 256 elements.
+            # Block Bytes: 260 bytes.
+            # Structure: [Delta (float32, 4 bytes)] + [Quants (int8, 256 bytes)]
+            #
+            # Note: The usage of float32 for delta distinguishes it from Q8_0.
+            # This is the primary format used in "Q8_K_XL" GGUF files.
+
             block_size = 256
             block_stride = 260
             num_blocks = num_elem // block_size
@@ -256,9 +302,16 @@ class GGUFReader:
 
 
 class QuantizedTensor:
+    """
+    Holds weights in a split structure (quants + scales) to support fused operations.
+    - q: The int8 quantized values [Out, In_Blocks, BlockSize]
+    - s: The float32 block scales [Out, In_Blocks]
+
+    This avoids expanding the entire weight matrix to float32 (which would be 4GB+ for 1B params),
+    keeping it compact (~1GB).
+    """
+
     def __init__(self, quants, scales, block_size):
-        # quants: [Out, In_Blocks, BlockSize] (int8)
-        # scales: [Out, In_Blocks] (float32)
         self.q = quants
         self.s = scales
         self.block_size = block_size
@@ -274,13 +327,21 @@ class QuantizedTensor:
 
 def matmul_fused(x: np.ndarray, w: Union[np.ndarray, QuantizedTensor]) -> np.ndarray:
     """
-    Computes x @ w.T
-    Handles both standard F32 arrays and QuantizedTensor.
+    Computes x @ w.T using a fused kernel approach for quantized weights.
+
+    Standard Approach: Dequantize W -> F32 [Out, In], then compute x @ W.T.
+    Fused Approach:
+      1. Reshape x to [..., In_blocks, BlockSize].
+      2. Dot product x_blocks against w.q (int8) -> Accumulate in F32.
+      3. Multiply result by w.s (scales).
+      4. Sum over blocks.
+
+    This preserves memory bandwidth and mimics GPU quantized kernels.
     """
     if isinstance(w, np.ndarray):
         return x @ w.T
 
-    # Quantized Fused Matmul
+    # Quantized Fused Matmul logic
     # x: [In] or [Batch, In]
     # w.q: [Out, In_blocks, BlockSize]
     # w.s: [Out, In_blocks]
@@ -439,8 +500,17 @@ class QwenNumpyModel:
         ).astype(x.dtype)
 
     def apply_rope(self, xq, xk, pos_idx):
+        """
+        Rotary Positional Embeddings (RoPE).
+        Qwen/Llama use "NEOX" style rotation:
+          Instead of adjacent pairs (-x1, x0), it splits the head dimension into two halves:
+          [x_0...x_half | x_half...x_end]
+          And rotates elements (x_i, x_{i+half}).
+        """
         dim = self.config.head_dim
-        # Precompute theta
+
+        # 1. Compute Theta
+        # Standard RoPE formula: theta_i = base ^ (-2i / dim)
         theta = (
             1.0
             / (
@@ -456,12 +526,13 @@ class QwenNumpyModel:
 
         def rotate(x):
             # x shape: [heads, dim]
-            # Use NEOX style rotation (split halves)
+            # Split into two halves (NEOX style)
             x = x.astype(np.float32)
             half = dim // 2
             x1 = x[..., :half]
             x2 = x[..., half:]
 
+            # Apply rotation matrix
             x1_new = x1 * cos_vals - x2 * sin_vals
             x2_new = x1 * sin_vals + x2 * cos_vals
             return np.concatenate((x1_new, x2_new), axis=-1)
@@ -469,16 +540,38 @@ class QwenNumpyModel:
         return rotate(xq), rotate(xk)
 
     def forward(self, token_id: int, pos: int, kv_cache=None):
-        # x: [dim]
+        """
+        Runs the transformer forward pass for a single token.
+        This includes:
+        - Embedding Lookup
+        - N Layers of:
+            - RMSNorm (Pre-Norm)
+            - QKV Projections (Fused)
+            - QK-Norm (Qwen specific)
+            - RoPE (Rotary Embedding)
+            - KV Cache Update
+            - GQA (Grouped Query Attention)
+            - Softmax Attention
+            - FFN (SwiGLU)
+        - Final Norm & Classifier
+        """
+        # 1. Embedding
+        # Directly lookup (copy) from embedding table (usually F32 or Q8)
         x = self.weights["token_embd"][token_id].copy()
 
         for i in range(self.config.n_layer):
             p = f"layer.{i}"
             residual = x.copy()
 
-            # --- Attention ---
+            # --- Attention Block ---
+
+            # Pre-Norm
             x = self.rms_norm(x, self.weights[f"layer.{i}.attn_norm"])
 
+            # QKV Projections (Fused Matmul)
+            # x: [Dim]
+            # wq/wk/wv: QuantizedTensor [Out, Dim]
+            # Output: [Out]
             wq = self.weights[f"{p}.attn_q"]
             wk = self.weights[f"{p}.attn_k"]
             wv = self.weights[f"{p}.attn_v"]
@@ -487,11 +580,13 @@ class QwenNumpyModel:
             k = matmul_fused(x, wk)
             v = matmul_fused(x, wv)
 
+            # Reshape for multi-head
             q = q.reshape(self.config.n_head, self.config.head_dim)
             k = k.reshape(self.config.n_head_kv, self.config.head_dim)
             v = v.reshape(self.config.n_head_kv, self.config.head_dim)
 
-            # Q/K Norm (Shared across heads)
+            # Q-Norm / K-Norm (Qwen 3 Feature)
+            # RMSNorm applied to Q and K vectors before RoPE
             if self.weights.get(f"{p}.attn_q_norm") is not None:
                 w_q_norm = self.weights[f"{p}.attn_q_norm"]
                 w_k_norm = self.weights[f"{p}.attn_k_norm"]
@@ -502,26 +597,30 @@ class QwenNumpyModel:
             # RoPE
             q, k = self.apply_rope(q, k, pos)
 
-            # KV Cache
+            # KV Cache Management
             if kv_cache is not None:
-                # Update cache in-place
+                # Store current k/v in pre-allocated buffer
                 kv_cache[i][0][pos] = k
                 kv_cache[i][1][pos] = v
 
-                # Get view of history up to current pos
+                # Retrieve history (0..pos)
                 K_seq = kv_cache[i][0][: pos + 1]  # [T, Hkv, D]
                 V_seq = kv_cache[i][1][: pos + 1]
             else:
                 K_seq = k[np.newaxis, ...]
                 V_seq = v[np.newaxis, ...]
 
-            # GQA Broadcast
+            # GQA Broadcast (if n_head > n_kv_head)
+            # Repeat K/V to match query heads
             n_rep = self.config.n_head // self.config.n_head_kv
             if n_rep > 1:
                 K_seq = np.repeat(K_seq, n_rep, axis=1)
                 V_seq = np.repeat(V_seq, n_rep, axis=1)
 
-            # Attention Scores
+            # SDPA (Scaled Dot Product Attention)
+            # q: [H, D]
+            # K_seq: [T, H, D]
+            # einsum "hd,thd->ht": dot product over D for each Head and Time
             scale = 1.0 / np.sqrt(self.config.head_dim)
             scores = np.einsum("hd,thd->ht", q, K_seq) * scale
 
@@ -530,15 +629,21 @@ class QwenNumpyModel:
             exp_scores = np.exp(scores - scores_max)
             probs = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
 
-            # Output
+            # Weighted Sum
+            # probs: [H, T]
+            # V_seq: [T, H, D]
+            # einsum "ht,thd->hd": sum over T
             attn_out = np.einsum("ht,thd->hd", probs, V_seq)
             attn_out = attn_out.reshape(-1)
 
+            # Output Projection
             x = matmul_fused(attn_out, self.weights[f"{p}.attn_out"])
             x += residual
             residual = x.copy()
 
-            # --- FFN ---
+            # --- FFN Block (SwiGLU) ---
+            # Gate/Up projections -> Activation -> Down projection
+
             x = self.rms_norm(x, self.weights[f"layer.{i}.ffn_norm"])
 
             w_gate = self.weights[f"{p}.ffn_gate"]
@@ -548,9 +653,8 @@ class QwenNumpyModel:
             gate = matmul_fused(x, w_gate)
             up = matmul_fused(x, w_up)
 
-            # SwiGLU (Stable Sigmoid)
-            # silu(x) = x * sigmoid(x)
-            # Use float64 for exp to avoid overflow warnings with large negative values
+            # Activation: Silu(gate) * up
+            # Stable Sigmoid to prevent overflow in exp(-gate) for large negative values
             gate_f64 = gate.astype(np.float64)
             sigmoid = 1.0 / (1.0 + np.exp(-gate_f64))
             silu = gate * sigmoid.astype(gate.dtype)
@@ -560,7 +664,7 @@ class QwenNumpyModel:
 
             x += residual
 
-        # Final Norm
+        # Final Norm & Classifier
         x = self.rms_norm(x, self.weights["output_norm"])
         logits = matmul_fused(x, self.weights["output"])
         return logits
