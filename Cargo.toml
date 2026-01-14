@@ -1,9 +1,11 @@
 [workspace]
 members = [
-    "crates/fuse",
+    "crates/fuse", "prototypes/hip-explore",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 anyhow = "1.0"
 cubecl = { version = "0.9.0-pre.6", features = ["cpu", "wgpu"] }
+cubecl-hip-sys = "7.0.5183101"
+libc = "0.2.180"

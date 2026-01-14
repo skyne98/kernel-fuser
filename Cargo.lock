@@ -1303,6 +1303,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hip-explore"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cubecl-hip-sys",
+ "libc",
+]
+
+[[package]]
 name = "http"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
