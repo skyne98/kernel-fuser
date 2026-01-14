@@ -17,17 +17,16 @@ Assistant: Hello! How can I assist you today?
 ## Features
 
 - **Native GGUF Reader**: Implements a complete GGUF v3 parser in pure Python. No external C++ bindings are required to load weights.
-- **Quantization Support**: Natively dequantizes the following types into Float32 for Numpy arithmetic:
-  - `Q8_0` (Block size 32, f16 delta)
-  - `Q8_K` (Block size 256, f32 delta)
-  - *F16 and F32 tensors are also supported.*
+- **Fused Quantization**: Weights are stored in their native quantized format (`Q8_K`, `Q8_0`) in RAM. Dequantization happens **on-the-fly** during matrix multiplication.
+  - Reduces memory usage by ~4x compared to full F32 loading.
+  - Implements a vectorized `matmul_fused` kernel in Numpy.
 - **Architecture**:
   - RMSNorm (Pre-Norm & QK-Norm)
   - RoPE (Rotary Positional Embeddings) with high frequency base (1M) and **NEOX-style (split-half) rotation**.
   - Grouped Query Attention (GQA) with broadcasting
   - SwiGLU Feed-Forward Network
 - **Inference**:
-  - KV Cache implementation.
+  - Optimized KV Cache (Pre-allocated buffers, zero-copy views).
   - Greedy and Temperature sampling.
   - Integration with `llama-cpp-python` for accurate tokenization.
 
@@ -63,12 +62,18 @@ pip install numpy llama-cpp-python
 ### GGUF Parsing
 The `GGUFReader` class uses memory mapping (`mmap`) to efficiently parse the binary file format. It extracts metadata (KV pairs) to automatically configure the model dimensions (layers, heads, embedding size, RoPE freq) and locates tensor offsets.
 
-### Dequantization
-To perform math in Numpy, quantized weights must be converted to floats.
-- **Q8_0**: Reads 34-byte blocks. Extracts a 16-bit float scale and 32 8-bit integers.
-- **Q8_K**: Reads 260-byte blocks. Extracts a 32-bit float scale and 256 8-bit integers.
+### Fused Matmul (Quantization)
+Instead of dequantizing all weights to Float32 at load time (which consumes huge bandwidth and RAM), this prototype keeps weights as `QuantizedTensor` objects containing:
+- `q`: Int8 tensor `[Out, In_Blocks, BlockSize]`
+- `s`: Float32 scale tensor `[Out, In_Blocks]`
 
-This logic mirrors the C++ implementation in `llama.cpp` `ggml-quants.c`.
+The `matmul_fused` function computes `x @ W.T` by:
+1. Reshaping input `x` to `[In_Blocks, BlockSize]`.
+2. Performing dot products against `w.q` (accumulating in Float32).
+3. Multiplying results by `w.s`.
+4. Summing over blocks.
+
+This mimics the behavior of a specialized GPU/CPU kernel.
 
 ### RoPE (Rotary Embeddings)
 Qwen uses the "NEOX" style of RoPE, where the rotation is applied to split halves of the head vector:
@@ -76,7 +81,7 @@ Qwen uses the "NEOX" style of RoPE, where the rotation is applied to split halve
 x1, x2 = x[..., :half], x[..., half:]
 x_rotated = cat(x1 * cos - x2 * sin, x1 * sin + x2 * cos)
 ```
-This differs from the "Interleaved" style `(-x[1], x[0], -x[3], x[2]...)` often found in other implementations. Getting this correct was crucial for matching the reference output.
+This differs from the "Interleaved" style `(-x[1], x[0], -x[3], x[2]...)` often found in other implementations.
 
 ## Goals
 

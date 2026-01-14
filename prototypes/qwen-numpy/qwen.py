@@ -183,24 +183,65 @@ class GGUFReader:
             return arr.astype(np.float32).reshape(shape).copy()
 
         elif dtype_id == GGML_TYPE_Q8_0:
-            # Block size 32
+            # Load raw quantized data into QuantizedTensor
             block_size = 32
-            block_stride = 34  # 2 bytes delta (f16) + 32 bytes (int8)
+            block_stride = 34
             num_blocks = num_elem // block_size
-
             raw_bytes = raw_ptr[offset : offset + num_blocks * block_stride]
-            data = dequantize_q8_0(raw_bytes, num_blocks)
-            return data.reshape(shape)
+
+            # Parse struct-of-arrays style
+            data_view = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
+                num_blocks, block_stride
+            )
+            # Scales (f16)
+            scales = (
+                np.frombuffer(data_view[:, 0:2].flatten(), dtype=np.float16)
+                .astype(np.float32)
+                .copy()
+            )
+            # Quants (int8)
+            quants = (
+                np.frombuffer(data_view[:, 2:].flatten(), dtype=np.int8)
+                .reshape(num_blocks, block_size)
+                .copy()
+            )
+
+            # Reshape to logical dims [Out, In_blocks] for scales and [Out, In_blocks, BlockSize] for quants
+            # We assume dim[-1] is the one that was quantized (Input dimension)
+            # shape is (Out, In) usually
+            out_dim = shape[0]
+            in_blocks = shape[1] // block_size
+            scales = scales.reshape(out_dim, in_blocks)
+            quants = quants.reshape(out_dim, in_blocks, block_size)
+
+            return QuantizedTensor(quants, scales, block_size)
 
         elif dtype_id == GGML_TYPE_Q8_K:
-            # Block size 256
             block_size = 256
-            block_stride = 260  # 4 bytes delta (f32) + 256 bytes (int8)
+            block_stride = 260
             num_blocks = num_elem // block_size
-
             raw_bytes = raw_ptr[offset : offset + num_blocks * block_stride]
-            data = dequantize_q8_k(raw_bytes, num_blocks)
-            return data.reshape(shape)
+
+            data_view = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
+                num_blocks, block_stride
+            )
+            scales = (
+                np.frombuffer(data_view[:, 0:4].flatten(), dtype=np.float32)
+                .astype(np.float32)
+                .copy()
+            )
+            quants = (
+                np.frombuffer(data_view[:, 4:].flatten(), dtype=np.int8)
+                .reshape(num_blocks, block_size)
+                .copy()
+            )
+
+            out_dim = shape[0]
+            in_blocks = shape[1] // block_size
+            scales = scales.reshape(out_dim, in_blocks)
+            quants = quants.reshape(out_dim, in_blocks, block_size)
+
+            return QuantizedTensor(quants, scales, block_size)
 
         else:
             print(
@@ -210,58 +251,74 @@ class GGUFReader:
 
 
 # -----------------------------------------------------------------------------
-# Dequantization Logic
+# Quantization Support
 # -----------------------------------------------------------------------------
 
 
-def dequantize_q8_0(raw_bytes: bytes, num_blocks: int) -> np.ndarray:
-    """
-    Dequantize Q8_0 blocks.
-    Structure: delta (f16), qs (int8 * 32)
-    """
-    block_size = 32
-    block_stride = 34
+class QuantizedTensor:
+    def __init__(self, quants, scales, block_size):
+        # quants: [Out, In_Blocks, BlockSize] (int8)
+        # scales: [Out, In_Blocks] (float32)
+        self.q = quants
+        self.s = scales
+        self.block_size = block_size
+        self.out_dim = quants.shape[0]
+        self.in_dim = quants.shape[1] * block_size
+        self.shape = (self.out_dim, self.in_dim)
 
-    data_view = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
-        num_blocks, block_stride
+    @property
+    def T(self):
+        # Logical transpose for x @ w.T syntax
+        return self
+
+
+def matmul_fused(x: np.ndarray, w: Union[np.ndarray, QuantizedTensor]) -> np.ndarray:
+    """
+    Computes x @ w.T
+    Handles both standard F32 arrays and QuantizedTensor.
+    """
+    if isinstance(w, np.ndarray):
+        return x @ w.T
+
+    # Quantized Fused Matmul
+    # x: [In] or [Batch, In]
+    # w.q: [Out, In_blocks, BlockSize]
+    # w.s: [Out, In_blocks]
+
+    bs = w.block_size
+    orig_shape = x.shape
+    x_flat = x.flatten()
+
+    # Verify dims
+    if x_flat.shape[-1] != w.in_dim:
+        raise ValueError(f"Shape mismatch: x {x.shape} vs w {w.shape}")
+
+    # Reshape x to [In_blocks, BlockSize]
+    # We assume x is contiguous for reshaping
+    x_blocked = x_flat.reshape(-1, bs)
+
+    # 1. Dot product with quants (int8 computation or float32 accumulation)
+    # x_blocked: [In_blocks, BlockSize]
+    # w.q:       [Out, In_blocks, BlockSize]
+    # We want sum over BlockSize first.
+    # Result: [Out, In_blocks]
+
+    # Use float32 for accumulation to avoid overflow
+    # np.einsum is efficient here
+    # 'ib,oib->oi'
+    dot_products = np.einsum(
+        "ib,oib->oi", x_blocked.astype(np.float32), w.q.astype(np.float32)
     )
 
-    # Delta is first 2 bytes (f16)
-    delta_bytes = data_view[:, 0:2].flatten()
-    deltas = np.frombuffer(delta_bytes, dtype=np.float16).astype(np.float32)
+    # 2. Apply scales
+    # w.s: [Out, In_blocks]
+    scaled = dot_products * w.s
 
-    # Quants are next 32 bytes (int8)
-    qs_bytes = data_view[:, 2:].flatten()
-    qs = np.frombuffer(qs_bytes, dtype=np.int8).reshape(num_blocks, block_size)
+    # 3. Sum over blocks
+    # Result: [Out]
+    out = np.sum(scaled, axis=1)
 
-    # Value = delta * qs
-    result = qs.astype(np.float32) * deltas[:, np.newaxis]
-    return result.flatten()
-
-
-def dequantize_q8_k(raw_bytes: bytes, num_blocks: int) -> np.ndarray:
-    """
-    Dequantize Q8_K blocks.
-    Structure: delta (f32), qs (int8 * 256)
-    """
-    block_size = 256
-    block_stride = 260
-
-    data_view = np.frombuffer(raw_bytes, dtype=np.uint8).reshape(
-        num_blocks, block_stride
-    )
-
-    # Delta is first 4 bytes (f32)
-    delta_bytes = data_view[:, 0:4].flatten()
-    deltas = np.frombuffer(delta_bytes, dtype=np.float32)
-
-    # Quants are next 256 bytes (int8)
-    qs_bytes = data_view[:, 4:].flatten()
-    qs = np.frombuffer(qs_bytes, dtype=np.int8).reshape(num_blocks, block_size)
-
-    # Value = delta * qs
-    result = qs.astype(np.float32) * deltas[:, np.newaxis]
-    return result.flatten()
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -426,9 +483,9 @@ class QwenNumpyModel:
             wk = self.weights[f"{p}.attn_k"]
             wv = self.weights[f"{p}.attn_v"]
 
-            q = x @ wq.T
-            k = x @ wk.T
-            v = x @ wv.T
+            q = matmul_fused(x, wq)
+            k = matmul_fused(x, wk)
+            v = matmul_fused(x, wv)
 
             q = q.reshape(self.config.n_head, self.config.head_dim)
             k = k.reshape(self.config.n_head_kv, self.config.head_dim)
@@ -447,10 +504,13 @@ class QwenNumpyModel:
 
             # KV Cache
             if kv_cache is not None:
-                kv_cache[i][0].append(k)
-                kv_cache[i][1].append(v)
-                K_seq = np.array(kv_cache[i][0])  # [T, Hkv, D]
-                V_seq = np.array(kv_cache[i][1])
+                # Update cache in-place
+                kv_cache[i][0][pos] = k
+                kv_cache[i][1][pos] = v
+
+                # Get view of history up to current pos
+                K_seq = kv_cache[i][0][: pos + 1]  # [T, Hkv, D]
+                V_seq = kv_cache[i][1][: pos + 1]
             else:
                 K_seq = k[np.newaxis, ...]
                 V_seq = v[np.newaxis, ...]
@@ -474,7 +534,7 @@ class QwenNumpyModel:
             attn_out = np.einsum("ht,thd->hd", probs, V_seq)
             attn_out = attn_out.reshape(-1)
 
-            x = attn_out @ self.weights[f"{p}.attn_out"].T
+            x = matmul_fused(attn_out, self.weights[f"{p}.attn_out"])
             x += residual
             residual = x.copy()
 
@@ -485,19 +545,24 @@ class QwenNumpyModel:
             w_up = self.weights[f"{p}.ffn_up"]
             w_down = self.weights[f"{p}.ffn_down"]
 
-            gate = x @ w_gate.T
-            up = x @ w_up.T
+            gate = matmul_fused(x, w_gate)
+            up = matmul_fused(x, w_up)
 
-            # SwiGLU
-            silu = gate / (1.0 + np.exp(-gate))
+            # SwiGLU (Stable Sigmoid)
+            # silu(x) = x * sigmoid(x)
+            # Use float64 for exp to avoid overflow warnings with large negative values
+            gate_f64 = gate.astype(np.float64)
+            sigmoid = 1.0 / (1.0 + np.exp(-gate_f64))
+            silu = gate * sigmoid.astype(gate.dtype)
+
             merged = silu * up
-            x = merged @ w_down.T
+            x = matmul_fused(merged, w_down)
 
             x += residual
 
         # Final Norm
         x = self.rms_norm(x, self.weights["output_norm"])
-        logits = x @ self.weights["output"].T
+        logits = matmul_fused(x, self.weights["output"])
         return logits
 
 
@@ -562,7 +627,23 @@ def main():
     print(f"Prompt tokens (add_bos={add_bos}): {tokens}")
 
     # 4. Generation Loop
-    kv_cache = [[[], []] for _ in range(model.config.n_layer)]
+    # Pre-allocate KV Cache
+    # Shape: [n_layers, 2 (K/V), max_seq, n_head_kv, head_dim]
+    max_seq_len = len(tokens) + args.steps + 16  # padding
+    kv_cache = []
+    for _ in range(model.config.n_layer):
+        # Use zeros. float32 to match weights
+        k_cache = np.zeros(
+            (max_seq_len, model.config.n_head_kv, model.config.head_dim),
+            dtype=np.float32,
+        )
+        v_cache = np.zeros(
+            (max_seq_len, model.config.n_head_kv, model.config.head_dim),
+            dtype=np.float32,
+        )
+        kv_cache.append(
+            (k_cache, v_cache)
+        )  # Tuple or list is fine, code uses index 0/1
 
     print(f"\n--- Generating ({args.steps} steps) ---\n")
     print(args.prompt, end="", flush=True)
