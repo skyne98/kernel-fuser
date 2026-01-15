@@ -34,22 +34,22 @@ Performs a naive 256x256 Matrix Multiplication `C = A * B` where B is an Identit
 HSA_XNACK=1 cargo run --bin 03_lazy_managed
 ```
 Demonstrates Unified Memory (`hipMallocManaged`).
-- Allocates memory accessible to both Host and Device.
-- Initializes on Host (no explicit copy).
-- Kernel modifies data on Device (pages migrate/fault on demand).
-- Host verifies results (pages accessible again).
 
 ### 4. MMAP File Access (NVMe -> CPU -> GPU)
 ```bash
 HSA_XNACK=1 cargo run --bin 04_mmap_lazy
 ```
 Demonstrates "Zero-Copy" access to a file on disk (NVMe).
-- Creates a large file (256MB).
-- Maps it into Host memory (`mmap`).
-- **Registers** the pointer with HIP (`hipHostRegister`).
-  - *Note:* On systems without full HMM support (like the MI50 tested), this registration pins the memory, forcing a load from disk to RAM. True lazy loading requires `PageableMemoryAccess` support.
-- GPU reads directly from Host RAM (which mirrors the file).
-- Reads specific bytes to verify connectivity.
+
+### 5. P2P Benchmark (Multi-GPU)
+```bash
+cargo run --bin 05_p2p_benchmark
+```
+Benchmarks Peer-to-Peer communication between all available GPUs.
+- **Latency:** Ping-pong small messages.
+- **Bandwidth:** Uni-directional large transfers.
+- **Bidirectional:** Concurrent transfers between pairs.
+Useful for verifying XGMI/Infinity Fabric links.
 
 ## Features
 - Dynamic library linking via `build.rs`.
