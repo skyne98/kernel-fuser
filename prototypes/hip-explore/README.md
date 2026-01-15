@@ -21,37 +21,34 @@ Run specific binaries:
 ```bash
 cargo run --bin 01_simple_add
 ```
-Performs a simple `y = ax + b` calculation.
 
 ### 2. Matrix Multiplication
 ```bash
 cargo run --bin 02_matrix_mul
 ```
-Performs a naive 256x256 Matrix Multiplication `C = A * B` where B is an Identity matrix, verifying that `C == A`.
 
-### 3. Lazy Managed Memory (True Lazy)
+### 3. Lazy Managed Memory
 ```bash
 HSA_XNACK=1 cargo run --bin 03_lazy_managed
 ```
-Demonstrates Unified Memory (`hipMallocManaged`).
 
-### 4. MMAP File Access (NVMe -> CPU -> GPU)
+### 4. MMAP File Access
 ```bash
 HSA_XNACK=1 cargo run --bin 04_mmap_lazy
 ```
-Demonstrates "Zero-Copy" access to a file on disk (NVMe).
 
-### 5. P2P Benchmark (Multi-GPU)
+### 5. P2P Benchmark
 ```bash
 cargo run --bin 05_p2p_benchmark
 ```
-Benchmarks Peer-to-Peer communication between all available GPUs.
-- **Latency:** Ping-pong small messages.
-- **Bandwidth:** Uni-directional large transfers.
-- **Bidirectional:** Concurrent transfers between pairs.
-Useful for verifying XGMI/Infinity Fabric links.
+
+### 6. Memory & Cache Info
+```bash
+cargo run --bin 06_memory_info
+```
+Queries detailed HBM memory capacity, bus widths, L2 cache sizes, and shared memory characteristics for each GPU.
 
 ## Features
 - Dynamic library linking via `build.rs`.
 - Runtime compilation (HIPRTC) of C++ kernels.
-- Multiple example kernels covering standard, managed, and mmap usage.
+- Multiple example kernels covering standard, managed, mmap, P2P, and introspection.
