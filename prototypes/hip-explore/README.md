@@ -17,10 +17,11 @@ To handle the version mismatch (System HIP 5.7 vs Crate expectation), we enable 
 
 Run specific binaries:
 
-### 1. Simple Vector Add
+### 1. Simple Vector Add (Raw)
 ```bash
 cargo run --bin 01_simple_add
 ```
+Uses raw `cubecl-hip-sys` bindings and manual resource management.
 
 ### 2. Matrix Multiplication
 ```bash
@@ -46,9 +47,20 @@ cargo run --bin 05_p2p_benchmark
 ```bash
 cargo run --bin 06_memory_info
 ```
-Queries detailed HBM memory capacity, bus widths, L2 cache sizes, and shared memory characteristics for each GPU.
+
+### 7. Parallel Upload Benchmark
+```bash
+cargo run --bin 07_parallel_upload
+```
+Tests serial vs distributed vs single-GPU multithreaded upload speeds.
+
+### 8. Simple Vector Add (Safe Wrapper)
+```bash
+cargo run --bin 08_simple_add_safe
+```
+Identical to binary 01, but uses the safe Rust wrapper in `src/lib.rs` for automatic resource cleanup and error handling.
 
 ## Features
-- Dynamic library linking via `build.rs`.
-- Runtime compilation (HIPRTC) of C++ kernels.
-- Multiple example kernels covering standard, managed, mmap, P2P, and introspection.
+- **Safe Wrapper:** `src/lib.rs` provides RAII types (`DeviceBuffer`, `Stream`, `Module`, etc.) for HIP.
+- **Dynamic Linking:** Handled via `build.rs`.
+- **Runtime Compilation:** (HIPRTC) of C++ kernels.

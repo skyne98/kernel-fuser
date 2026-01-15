@@ -1309,6 +1309,7 @@ dependencies = [
  "anyhow",
  "cubecl-hip-sys",
  "libc",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
